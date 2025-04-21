@@ -246,3 +246,285 @@ class Ticket {
 - **Библиотека доступа к БД:** PDO
 - **Фронтенд:** HTML, CSS, Bootstrap
 ---
+
+## 5. Авторизация и безопасность
+
+### 🔐 Авторизация пользователя
+
+![Вход](readme_images/img_11.jpg)
+
+Для защиты доступа к страницам веб-интерфейса реализована система авторизации. Все защищённые страницы подключают следующий файл:
+
+```php
+require_once __DIR__ . '/../src/auth/require_admin.php';
+$admin = AuthService::admin();
+```
+
+![Приветствие](readme_images/img_10.jpg)
+
+Если пользователь не авторизован, происходит перенаправление на страницу входа. В сессии хранится информация об авторизованном пользователе.
+
+---
+
+### 🔐 Хэширование пароля
+
+Пароли хранятся в зашифрованном виде:
+
+```php
+$passwordHash = password_hash($password, PASSWORD_DEFAULT);
+```
+
+![Зашифрованный пароль](readme_images/img_12.jpg)
+
+Проверка пароля при авторизации:
+
+```php
+password_verify($inputPassword, $storedHash);
+```
+
+---
+
+### 🛡️ Валидация данных и защита от инъекций
+
+Используется класс `Validator` для проверки и очистки всех пользовательских данных на стороне сервера.
+
+#### ✅ Примеры валидации и очистки:
+
+**Очистка строк:**
+```php
+public static function sanitizeString($input): string {
+    $input = trim($input);
+    $input = strip_tags($input);
+    $input = htmlspecialchars($input, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $input = str_ireplace([...], '', $input); // фильтрация SQL-ключевых слов
+    return $input;
+}
+```
+
+**Проверка даты/времени:**
+
+![Валидация длительности](readme_images/img_13.jpg)
+
+```php
+public static function isValidDateTime(string $datetime): bool {
+    $formats = ['Y-m-d\TH:i', 'Y-m-d H:i'];
+    foreach ($formats as $format) {
+        $dt = DateTime::createFromFormat($format, $datetime);
+        if ($dt && empty(DateTime::getLastErrors()['error_count'])) {
+            return (int)$dt->format('Y') >= (int)date('Y');
+        }
+    }
+    return false;
+}
+```
+
+**Проверка чисел и флагов:**
+```php
+public static function isValidNumber($value): bool {
+    return is_numeric($value) && $value >= 0;
+}
+
+public static function isValidCheckbox($value): bool {
+    return in_array($value, ['0', '1', 0, 1, true, false], true);
+}
+```
+
+---
+
+### 🚫 Защита от некорректного удаления связанных данных
+
+![Удаление связанных данных](readme_images/img_14.jpg)
+
+```php
+public static function canDeleteRecord(PDO $pdo, string $table, int $id): bool {
+    switch ($table) {
+        case 'movies':
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM showings WHERE movie_id = :id");
+            break;
+        case 'auditoriums':
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM showings WHERE auditorium_id = :id");
+            break;
+        case 'showings':
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM tickets WHERE showing_id = :id");
+            break;
+        default:
+            return true;
+    }
+
+    $stmt->execute(['id' => $id]);
+    return $stmt->fetchColumn() == 0;
+}
+```
+
+---
+
+### 🔒 Защита от подмены адресов
+
+Допустимые значения для параметра `table` контролируются явно:
+
+```php
+$allowedTables = ['movies', 'auditoriums', 'showings', 'tickets', 'report_hall_stats', 'report_film_tickets', 'report_film_stats'];
+if (!in_array($table, $allowedTables, true)) {
+    header('Location: ' . $_SERVER['PHP_SELF'] . '?table=movies');
+    exit;
+}
+```
+
+---
+
+## 6. Отчётность
+
+Система содержит три отчётных модуля с отображением в таблице и возможностью выгрузки в файлы Excel/Word.
+
+---
+
+### 📋 Список билетов на фильм
+
+![Отчет по билетам на фильм](readme_images/img_15.jpg)
+
+Метод для генерации отчета по всем билетам на фильм:
+
+```php
+public function ReportTicketsForFilm(int $filmId): array {
+    $sql = "
+    SELECT 
+        t.seat_number AS \"Место\",
+        s.start_time AS \"Время показа\",
+        a.name AS \"Кинозал\"
+    FROM \"tickets\" t
+    JOIN \"showings\" s ON t.showing_id = s.id
+    JOIN \"movies\" m ON s.movie_id = m.id
+    JOIN \"auditoriums\" a ON s.auditorium_id = a.id
+    WHERE m.id = :filmId
+    ORDER BY s.start_time
+    ";
+    $stmt = $this->pdo->prepare($sql);
+    $stmt->execute(['filmId' => $filmId]);
+    return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+}
+```
+
+---
+
+### 📊 Статистика по фильмам
+
+![Отчет по купленным билетам и выручки с  фильмов](readme_images/img_16.jpg)
+
+
+Агрегированный отчёт по фильмам:
+
+```php
+public function ReportStatsForAllFilms(): array {
+    $sql = "
+    SELECT 
+        m.title AS \"Фильм\",
+        COUNT(t.id) AS \"Куплено\",
+        COUNT(t.id) * m.price AS \"Выручка\"
+    FROM \"tickets\" t
+    JOIN \"showings\" s ON t.showing_id = s.id
+    JOIN \"movies\" m ON s.movie_id = m.id
+    GROUP BY m.id, m.title, m.price
+    ORDER BY \"Выручка\" DESC
+    ";
+    $stmt = $this->pdo->query($sql);
+    return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+}
+```
+
+---
+
+### 🏟️ Статистика по залам
+
+![Отчет по купленным билетам и выручки с  кинозалов](readme_images/img_17.jpg)
+
+Отчёт по загруженности и доходности залов:
+
+```php
+public function ReportStatsForAllHalls(): array {
+    $sql = "
+    SELECT 
+        a.name AS \"Аудитория\",
+        COUNT(t.id) AS \"Куплено\",
+        SUM(m.price) AS \"Выручка\"
+    FROM \"tickets\" t
+    JOIN \"showings\" s ON t.showing_id = s.id
+    JOIN \"auditoriums\" a ON s.auditorium_id = a.id
+    JOIN \"movies\" m ON s.movie_id = m.id
+    GROUP BY a.id, a.name
+    ORDER BY \"Выручка\" DESC
+    ";
+    $stmt = $this->pdo->query($sql);
+    return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+}
+```
+
+---
+
+### 📥 Выгрузка в Excel и Word
+
+Для экспорта используется `PhpSpreadsheet` (Excel) и `PhpWord` (Word):
+
+```php
+$type = $_POST['type'] ?? '';
+$format = $_POST['format'] ?? '';
+$report = [];
+
+switch ($type) {
+    case 'film_tickets':
+        $id = (int)$_POST['film_id'];
+        $report = $db->ReportTicketsForFilm($id);
+        break;
+    case 'film_stats_all':
+        $report = $db->ReportStatsForAllFilms();
+        break;
+    case 'hall_stats_all':
+        $report = $db->ReportStatsForAllHalls();
+        break;
+    default:
+        exit("Неверный тип отчета.");
+}
+```
+
+#### 🧾 Экспорт в Excel:
+
+![Пример экспорта в Excel](readme_images/img_19.jpg)
+
+```php
+$spreadsheet = new Spreadsheet();
+$sheet = $spreadsheet->getActiveSheet();
+$sheet->fromArray(array_keys($report[0]), null, 'A1');
+$sheet->fromArray($report, null, 'A2');
+
+header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+header("Content-Disposition: attachment;filename=\"report.xlsx\"");
+(new Xlsx($spreadsheet))->save('php://output');
+```
+
+#### 📄 Экспорт в Word:
+
+![Пример экспорта в Word](readme_images/img_18.jpg)
+
+```php
+$word = new PhpWord();
+$section = $word->addSection();
+$section->addText($title, ['bold' => true, 'size' => 16]);
+
+$table = $section->addTable(['borderSize' => 6]);
+$table->addRow();
+foreach (array_keys($report[0]) as $col) {
+    $table->addCell(2000)->addText($col, ['bold' => true]);
+}
+
+foreach ($report as $row) {
+    $table->addRow();
+    foreach ($row as $val) {
+        $table->addCell(2000)->addText($val);
+    }
+}
+
+header('Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+header("Content-Disposition: attachment;filename=\"report.docx\"");
+IOFactory::createWriter($word, 'Word2007')->save('php://output');
+```
+
+--- 

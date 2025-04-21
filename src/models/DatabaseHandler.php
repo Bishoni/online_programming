@@ -135,5 +135,57 @@ class DatabaseHandler {
         }
         return $tickets;
     }
+
+    public function ReportTicketsForFilm(int $filmId): array {
+        $sql = "
+        SELECT 
+            t.seat_number AS \"Место\",
+            s.start_time AS \"Время показа\",
+            a.name AS \"Кинозал\"
+        FROM \"tickets\" t
+        JOIN \"showings\" s ON t.showing_id = s.id
+        JOIN \"movies\" m ON s.movie_id = m.id
+        JOIN \"auditoriums\" a ON s.auditorium_id = a.id
+        WHERE m.id = :filmId
+        ORDER BY s.start_time
+    ";
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute(['filmId' => $filmId]);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public function ReportStatsForAllFilms(): array {
+        $sql = "
+        SELECT 
+            m.title AS \"Фильм\",
+            COUNT(t.id) AS \"Куплено\",
+            COUNT(t.id) * m.price AS \"Выручка\"
+        FROM \"tickets\" t
+        JOIN \"showings\" s ON t.showing_id = s.id
+        JOIN \"movies\" m ON s.movie_id = m.id
+        GROUP BY m.id, m.title, m.price
+        ORDER BY \"Выручка\" DESC
+    ";
+        $stmt = $this->pdo->query($sql);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public function ReportStatsForAllHalls(): array {
+        $sql = "
+        SELECT 
+            a.name AS \"Аудитория\",
+            COUNT(t.id) AS \"Куплено\",
+            SUM(m.price) AS \"Выручка\"
+        FROM \"tickets\" t
+        JOIN \"showings\" s ON t.showing_id = s.id
+        JOIN \"auditoriums\" a ON s.auditorium_id = a.id
+        JOIN \"movies\" m ON s.movie_id = m.id
+        GROUP BY a.id, a.name
+        ORDER BY \"Выручка\" DESC
+    ";
+        $stmt = $this->pdo->query($sql);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
 }
 ?>

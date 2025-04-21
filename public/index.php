@@ -1,4 +1,9 @@
 <?php
+require_once __DIR__ . '/../src/auth/require_admin.php';
+
+use App\auth\AuthService;
+
+$admin = AuthService::admin();
 require_once __DIR__ . '/../vendor/autoload.php';
 use App\models\DatabaseHandler;
 use App\models\Movie;
@@ -10,89 +15,295 @@ $pdo = $db->getPdo();
 $table = $_POST['table'] ?? ($_GET['table'] ?? 'movies');
 $activeShowingId = null;
 $ticketsForShowing = [];
+
+
+$allowedTables = ['movies', 'auditoriums', 'showings', 'tickets', 'report_hall_stats', 'report_film_tickets', 'report_film_stats'];
+if (!in_array($table, $allowedTables, true)) {
+    header('Location: ' . $_SERVER['PHP_SELF'] . '?table=movies');
+    exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['show_tickets'])) {
     $activeShowingId = $_POST['showing_id'];
     $ticketsForShowing = $db->GetTicketsForShowing($activeShowingId);
 }
+
+class Validator {
+    public static function recordExists(PDO $pdo, string $table, int $id): bool {
+        $stmt = $pdo->prepare("SELECT 1 FROM {$table} WHERE id = :id LIMIT 1");
+        $stmt->execute(['id' => $id]);
+        return (bool) $stmt->fetch();
+    }
+
+    public static function sanitizeString($input): string {
+        $input = trim($input);
+        $input = strip_tags($input);
+        $input = htmlspecialchars($input, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $input = str_ireplace(
+            ['--', ';', '\'', '"', '/*', '*/', '@@', '@', 'char', 'nchar', 'varchar', 'nvarchar', 'alter', 'begin', 'cast', 'create', 'cursor', 'declare', 'delete', 'drop', 'end', 'exec', 'execute', 'fetch', 'insert', 'kill', 'open', 'select', 'sys', 'sysobjects', 'syscolumns', 'table', 'update'],
+            '',
+            $input
+        );
+        return $input;
+    }
+
+    public static function isValidDuration($duration): bool {
+        return preg_match('/^\d{2}:\d{2}(:\d{2})?$/', $duration) === 1;
+    }
+
+    public static function isValidDateTime(string $datetime): bool {
+        $formats = [
+            'Y-m-d\TH:i',
+            'Y-m-d\TH:i:s',
+            'Y-m-d H:i',
+            'Y-m-d H:i:s',
+        ];
+
+        foreach ($formats as $format) {
+            $dt = DateTime::createFromFormat($format, $datetime);
+
+            if ($dt instanceof DateTime) {
+                $errors = DateTime::getLastErrors();
+                if (empty($errors['warning_count']) && empty($errors['error_count'])) {
+                    return (int)$dt->format('Y') >= (int)date('Y');
+                }
+            }
+        }
+
+        return false;
+    }
+
+    public static function isValidNumber($value): bool {
+        return is_numeric($value) && $value >= 0;
+    }
+
+    public static function isValidId($id): bool {
+        return ctype_digit((string) $id);
+    }
+
+    public static function isValidCheckbox($value): bool {
+        return in_array($value, ['0', '1', 0, 1, true, false], true);
+    }
+
+    public static function canDeleteRecord(PDO $pdo, string $table, int $id): bool {
+        switch ($table) {
+            case 'movies':
+                $stmt = $pdo->prepare("SELECT COUNT(*) FROM showings WHERE movie_id = :id");
+                break;
+            case 'auditoriums':
+                $stmt = $pdo->prepare("SELECT COUNT(*) FROM showings WHERE auditorium_id = :id");
+                break;
+            case 'showings':
+                $stmt = $pdo->prepare("SELECT COUNT(*) FROM tickets WHERE showing_id = :id");
+                break;
+            case 'tickets':
+                return true;
+            default:
+                return true;
+        }
+
+        $stmt->execute(['id' => $id]);
+        return $stmt->fetchColumn() == 0;
+    }
+
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['commit_changes'])) {
+    $errors = [];
+
     if ($table === 'movies' && isset($_POST['rows'])) {
         foreach ($_POST['rows'] as $key => $row) {
-            if (isset($row['delete']) && $row['delete'] == 1 && is_numeric($key)) {
-                $db->deleteMovie($row['id']);
-            } else {
-                if (strpos($key, 'new_') === 0) {
-                    if (empty($row['title']) && empty($row['duration']) && empty($row['price']) && !isset($row['has_3d'])) {
-                        continue;
-                    }
-                }
-                $title    = isset($row['title']) ? $row['title'] : '';
-                $duration = isset($row['duration']) ? $row['duration'] : '00:00';
-                $price    = isset($row['price']) ? $row['price'] : 0;
-                $has3d    = isset($row['has_3d']) && $row['has_3d'] == 1 ? true : false;
-                $movie = new Movie(null, $title, $duration, $has3d, $price);
-                if (is_numeric($key)) {
-                    $movie->setId($row['id']);
-                }
-                $movie->save($pdo);
+            $isNew = str_starts_with($key, 'new_');
+            $shouldDelete = isset($row['delete']) && $row['delete'] == '1';
+            $id = $row['id'] ?? null;
+
+            if (!$isNew && !Validator::recordExists($pdo, 'movies', (int)$id)) {
+                $errors[] = "Фильм: запись не найдена.";
+                continue;
             }
+
+            if ($shouldDelete && !$isNew && Validator::isValidId($id)) {
+                if (!Validator::canDeleteRecord($pdo, 'movies', (int)$id)) {
+                    $errors[] = "Невозможно удалить фильм: есть связанные показы.";
+                    continue;
+                }
+                $stmt = $pdo->prepare("DELETE FROM movies WHERE id = :id");
+                $stmt->execute(['id' => $id]);
+                continue;
+            }
+
+            $title = Validator::sanitizeString($row['title'] ?? '');
+            $duration = $row['duration'] ?? '';
+            $price = $row['price'] ?? 0;
+            $has3d = isset($row['has_3d']) ? $row['has_3d'] : 0;
+
+            if ($isNew && empty($title) && empty($duration) && empty($price) && !$has3d) continue;
+
+            if (!Validator::isValidDuration($duration)) {
+                $errors[] = "Фильм: неверный формат длительности ($duration)";
+                continue;
+            }
+
+            if (!Validator::isValidNumber($price)) {
+                $errors[] = "Фильм: цена должна быть неотрицательным числом ($price)";
+                continue;
+            }
+
+            if (!Validator::isValidCheckbox($has3d)) {
+                $errors[] = "Фильм: некорректное значение поля 3D";
+                continue;
+            }
+
+            $movie = new Movie(null, $title, $duration, (bool)$has3d, (float)$price);
+            if (!$isNew) $movie->setId($id);
+            $movie->save($pdo);
         }
     } elseif ($table === 'auditoriums' && isset($_POST['rows'])) {
         foreach ($_POST['rows'] as $key => $row) {
-            if (isset($row['delete']) && $row['delete'] == 1 && is_numeric($key)) {
-                $db->deleteAuditorium($row['id']);
-            } else {
-                if (strpos($key, 'new_') === 0) {
-                    if (empty($row['name']) && empty($row['capacity']) && !isset($row['has_3d'])) {
-                        continue;
-                    }
-                }
-                $has3d = isset($row['has_3d']) && $row['has_3d'] == 1 ? true : false;
-                $auditorium = new Auditorium(null, $row['name'], $row['capacity'], $has3d);
-                if (is_numeric($key)) {
-                    $auditorium->setId($row['id']);
-                }
-                $auditorium->save($pdo);
+            $isNew = str_starts_with($key, 'new_');
+            $shouldDelete = isset($row['delete']) && $row['delete'] == '1';
+            $id = $row['id'] ?? null;
+
+            if (!$isNew && !Validator::recordExists($pdo, 'auditoriums', (int)$id)) {
+                $errors[] = "Аудитория: запись не найдена.";
+                continue;
             }
+
+            if ($shouldDelete && !$isNew && Validator::isValidId($id)) {
+                if (!Validator::canDeleteRecord($pdo, 'auditoriums', (int)$id)) {
+                    $errors[] = "Невозможно удалить аудиторию: есть связанные показы.";
+                    continue;
+                }
+                $stmt = $pdo->prepare("DELETE FROM auditoriums WHERE id = :id");
+                $stmt->execute(['id' => $id]);
+                continue;
+            }
+
+            $name = Validator::sanitizeString($row['name'] ?? '');
+            $capacity = $row['capacity'] ?? 0;
+            $has3d = $row['has_3d'] ?? 0;
+
+            if ($isNew && empty($name) && empty($capacity) && !$has3d) continue;
+
+            if (!Validator::isValidNumber($capacity)) {
+                $errors[] = "Аудитория: вместимость должна быть неотрицательным числом ($capacity)";
+                continue;
+            }
+
+            if (!Validator::isValidCheckbox($has3d)) {
+                $errors[] = "Аудитория: некорректное значение поля 3D";
+                continue;
+            }
+
+            $auditorium = new Auditorium(null, $name, (int)$capacity, (bool)$has3d);
+            if (!$isNew) $auditorium->setId($id);
+            $auditorium->save($pdo);
         }
     } elseif ($table === 'showings' && isset($_POST['rows'])) {
         foreach ($_POST['rows'] as $key => $row) {
-            if (isset($row['delete']) && $row['delete'] == 1 && is_numeric($key)) {
-                $db->deleteShowing($row['id']);
-            } else {
-                if (strpos($key, 'new_') === 0) {
-                    if (empty($row['movie_id']) || empty($row['auditorium_id']) || empty($row['start_time'])) {
-                        continue;
-                    }
-                }
-                $showing = new Showing(null, $row['movie_id'], $row['auditorium_id'], $row['start_time']);
-                if (is_numeric($key)) {
-                    $showing->setId($row['id']);
-                }
-                $showing->save($pdo);
+            $isNew = str_starts_with($key, 'new_');
+            $shouldDelete = isset($row['delete']) && $row['delete'] == '1';
+            $id = $row['id'] ?? null;
+
+            if (!$isNew && !Validator::recordExists($pdo, 'showings', (int)$id)) {
+                $errors[] = "Показ: запись не найдена.";
+                continue;
             }
+
+            if ($shouldDelete && !$isNew && Validator::isValidId($id)) {
+                if (!Validator::canDeleteRecord($pdo, 'showings', (int)$id)) {
+                    $errors[] = "Невозможно удалить показ: есть связанные билеты.";
+                    continue;
+                }
+                $stmt = $pdo->prepare("DELETE FROM showings WHERE id = :id");
+                $stmt->execute(['id' => $id]);
+                continue;
+            }
+
+            $movieId = $row['movie_id'] ?? '';
+            $auditoriumId = $row['auditorium_id'] ?? '';
+            $startTime = $row['start_time'] ?? '';
+
+            if ($isNew && (empty($movieId) || empty($auditoriumId) || empty($startTime))) continue;
+
+            if (!Validator::isValidId($movieId)) {
+                $errors[] = "Показ: неверный ID фильма ($movieId)";
+                continue;
+            }
+
+            if (!Validator::isValidId($auditoriumId)) {
+                $errors[] = "Показ: неверный ID аудитории ($auditoriumId)";
+                continue;
+            }
+
+            if (!Validator::isValidDateTime($startTime)) {
+                $errors[] = "Показ: неверная дата и время начала";
+                continue;
+            }
+
+            $showing = new Showing(null, $movieId, $auditoriumId, $startTime);
+            if (!$isNew) $showing->setId($id);
+            $showing->save($pdo);
         }
     }
+
     if (isset($_POST['tickets'])) {
         foreach ($_POST['tickets'] as $showingId => $ticketRows) {
+            if (!Validator::isValidId($showingId)) {
+                $errors[] = "Билет: неверный показ";
+                continue;
+            }
+
             foreach ($ticketRows as $key => $row) {
-                if (isset($row['delete']) && $row['delete'] == 1 && is_numeric($key)) {
-                    $db->deleteTicket($row['id']);
-                } else {
-                    if (strpos($key, 'new_') === 0) {
-                        if (empty($row['seat_number'])) continue;
-                    }
-                    $ticket = new Ticket(null, $showingId, $row['seat_number']);
-                    if (is_numeric($key)) {
-                        $ticket->setId($row['id']);
-                    }
-                    $ticket->save($pdo);
+                $isNew = str_starts_with($key, 'new_');
+                $shouldDelete = isset($row['delete']) && $row['delete'] == '1';
+                $id = $row['id'] ?? null;
+                $seatNumber = $row['seat_number'] ?? '';
+
+                if (!$isNew && !Validator::recordExists($pdo, 'tickets', (int)$id)) {
+                    $errors[] = "Билет: запись не найдена.";
+                    continue;
                 }
+
+                if ($shouldDelete && !$isNew && Validator::isValidId($id)) {
+                    $stmt = $pdo->prepare("DELETE FROM tickets WHERE id = :id");
+                    $stmt->execute(['id' => $id]);
+                    continue;
+                }
+
+                if ($isNew && empty($seatNumber)) continue;
+
+                if (!Validator::isValidNumber($seatNumber)) {
+                    $errors[] = "Билет: номер места должен быть неотрицательным числом ($seatNumber)";
+                    continue;
+                }
+
+                $ticket = new Ticket(null, $showingId, (int)$seatNumber);
+                if (!$isNew) $ticket->setId($id);
+                $ticket->save($pdo);
             }
         }
     }
-    header("Location: " . $_SERVER['PHP_SELF'] . "?table=" . urlencode($table));
-    exit();
+
+    $isAjax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && $_SERVER['HTTP_X_REQUESTED_WITH'] === 'XMLHttpRequest';
+
+    if ($isAjax) {
+        header('Content-Type: application/json');
+        echo json_encode([
+            'success' => empty($errors),
+            'message' => empty($errors) ? 'Изменения успешно сохранены!' : 'Обнаружены ошибки при сохранении',
+            'errors' => $errors
+        ]);
+        exit;
+    } else {
+        if (!headers_sent()) {
+            header("Location: " . $_SERVER['PHP_SELF'] . "?table=" . urlencode($table));
+            exit;
+        }
+    }
 }
+
+
 if ($table === 'movies') {
     $movies = $db->GetMovies();
     $moviesList = $db->GetMovies();
@@ -129,9 +340,53 @@ if ($table === 'tickets') {
         .table-responsive { margin-bottom: 20px; }
         .inline-form { display: inline; }
         option { color: #263238; }
+        .toast-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 10px;
+        }
+
+        .toast-message {
+            min-width: 250px;
+            max-width: 400px;
+            background-color: #323232;
+            color: #fff;
+            padding: 15px 20px;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            font-size: 0.95rem;
+            display: flex;
+            align-items: center;
+            opacity: 0;
+            animation: fadeIn 0.4s ease forwards;
+        }
+
+        .toast-message.success { background-color: #4CAF50; }
+        .toast-message.error   { background-color: #f44336; }
+
+        .toast-message strong {
+            margin-right: 8px;
+        }
+
+        @keyframes fadeIn {
+            to { opacity: 1; }
+        }
+        @keyframes fadeOut {
+            to { opacity: 0; transform: translateY(20px); }
+        }
     </style>
 </head>
 <body>
+<div class="container mt-3 mb-0 d-flex justify-content-between align-items-center">
+    <h4 class="mb-0">Добро пожаловать!</h4>
+    <a href="logout.php" class="btn btn-outline-danger btn-sm">Выйти</a>
+</div>
+<hr>
 <div class="container">
     <h1 class="text-center mb-4">Кинотеатр</h1>
     <form method="POST" class="mb-4">
@@ -141,13 +396,17 @@ if ($table === 'tickets') {
                     <option value="movies" <?= $table === 'movies' ? 'selected' : '' ?>>Фильмы</option>
                     <option value="auditoriums" <?= $table === 'auditoriums' ? 'selected' : '' ?>>Аудитории</option>
                     <option value="showings" <?= $table === 'showings' ? 'selected' : '' ?>>Показы</option>
+                    <option disabled>────── Отчёты ──────</option>
+                    <option value="report_film_tickets" <?= $table === 'report_film_tickets' ? 'selected' : '' ?>>Список билетов на фильм</option>
+                    <option value="report_film_stats" <?= $table === 'report_film_stats' ? 'selected' : '' ?>>Статистика по фильмам</option>
+                    <option value="report_hall_stats" <?= $table === 'report_hall_stats' ? 'selected' : '' ?>>Статистика по кинозалам</option>
                 </select>
             </div>
         </div>
     </form>
     <?php if ($table === 'movies'): ?>
         <h2 class="text-center mb-4">Редактирование фильмов</h2>
-        <form method="POST">
+        <form method="POST" id="crud-form">
             <input type="hidden" name="table" value="movies">
             <div class="table-responsive">
                 <table class="table table-bordered table-hover">
@@ -192,12 +451,12 @@ if ($table === 'tickets') {
                 </table>
             </div>
             <div class="text-center">
-                <button type="submit" name="commit_changes" class="btn btn-primary px-4">Перенести изменения в БД</button>
+                <button type="button" id="submit-btn" class="btn btn-primary px-4">Перенести изменения в БД</button>
             </div>
         </form>
     <?php elseif ($table === 'auditoriums'): ?>
         <h2 class="text-center mb-4">Редактирование аудиторий</h2>
-        <form method="POST">
+        <form method="POST" id="crud-form">
             <input type="hidden" name="table" value="auditoriums">
             <div class="table-responsive">
                 <table class="table table-bordered table-hover">
@@ -237,12 +496,12 @@ if ($table === 'tickets') {
                 </table>
             </div>
             <div class="text-center">
-                <button type="submit" name="commit_changes" class="btn btn-primary px-4">Перенести изменения в БД</button>
+                <button type="button" id="submit-btn" class="btn btn-primary px-4">Перенести изменения в БД</button>
             </div>
         </form>
     <?php elseif ($table === 'showings'): ?>
         <h2 class="text-center mb-4">Редактирование показов</h2>
-        <form method="POST">
+        <form method="POST" id="crud-form">
             <input type="hidden" name="table" value="showings">
             <div class="table-responsive">
                 <table class="table table-bordered table-hover">
@@ -362,12 +621,12 @@ if ($table === 'tickets') {
                 </table>
             </div>
             <div class="text-center">
-                <button type="submit" name="commit_changes" class="btn btn-primary px-4">Перенести изменения в БД</button>
+                <button type="button" id="submit-btn" class="btn btn-primary px-4">Перенести изменения в БД</button>
             </div>
         </form>
     <?php elseif ($table === 'tickets'): ?>
         <h2 class="text-center mb-4">Редактирование билетов</h2>
-        <form method="POST">
+        <form method="POST" id="crud-form">
             <input type="hidden" name="table" value="tickets">
             <div class="table-responsive">
                 <table class="table table-bordered table-hover">
@@ -418,13 +677,200 @@ if ($table === 'tickets') {
                 </table>
             </div>
             <div class="text-center">
-                <button type="submit" name="commit_changes" class="btn btn-primary px-4">Перенести изменения в БД</button>
+                <button type="button" id="submit-btn" class="btn btn-primary px-4">Перенести изменения в БД</button>
             </div>
         </form>
+    <?php elseif ($table === 'report_film_tickets'): ?>
+        <?php $moviesList = $db->GetMovies(); ?>
+        <h2 class="text-center mb-4">Список билетов на фильм</h2>
+        <form method="POST" class="form-inline mb-4">
+            <input type="hidden" name="table" value="report_film_tickets">
+            <div class="form-group mr-2">
+                <label for="film_id">Выберите фильм:</label>
+                <select name="film_id" id="film_id" class="custom-select ml-2">
+                    <?php foreach ($moviesList as $m): ?>
+                        <option value="<?= $m->id ?>" <?= isset($_POST['film_id']) && $_POST['film_id'] == $m->id ? 'selected' : '' ?>>
+                            <?= htmlspecialchars($m->title) ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <button type="submit" class="btn btn-primary ml-2">Показать</button>
+        </form>
+
+        <?php
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['film_id'])) {
+            $filmId = (int)$_POST['film_id'];
+            $report = $db->ReportTicketsForFilm($filmId);
+
+            if (!empty($report)): ?>
+                <div class="table-responsive">
+                    <table class="table table-bordered">
+                        <thead class="thead-light">
+                        <tr>
+                            <?php foreach (array_keys($report[0]) as $col): ?>
+                                <th><?= htmlspecialchars($col) ?></th>
+                            <?php endforeach; ?>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <?php foreach ($report as $row): ?>
+                            <tr>
+                                <?php foreach ($row as $value): ?>
+                                    <td><?= htmlspecialchars($value) ?></td>
+                                <?php endforeach; ?>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="text-center mb-4">
+                    <form method="post" action="export.php" target="_blank" class="d-inline">
+                        <input type="hidden" name="type" value="film_tickets">
+                        <input type="hidden" name="film_id" value="<?= $filmId ?>">
+                        <button name="format" value="excel" class="btn btn-success">📥 Скачать Excel</button>
+                        <button name="format" value="word" class="btn btn-secondary">📄 Скачать Word</button>
+                    </form>
+                </div>
+            <?php else: ?>
+                <div class="alert alert-warning">Нет данных по выбранному фильму.</div>
+            <?php endif;
+        }
+        ?>
+    <?php elseif ($table === 'report_film_stats'): ?>
+        <h2 class="text-center mb-4">Статистика по всем фильмам</h2>
+        <?php
+        $report = $db->ReportStatsForAllFilms();
+        if (!empty($report)): ?>
+            <table class="table table-bordered">
+                <thead class="thead-light">
+                <tr>
+                    <?php foreach (array_keys($report[0]) as $col): ?>
+                        <th><?= htmlspecialchars($col) ?></th>
+                    <?php endforeach; ?>
+                </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($report as $row): ?>
+                    <tr>
+                        <?php foreach ($row as $val): ?>
+                            <td><?= htmlspecialchars($val) ?></td>
+                        <?php endforeach; ?>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+            <div class="text-center mb-4">
+                <form method="post" action="export.php" target="_blank" class="d-inline">
+                    <input type="hidden" name="type" value="film_stats_all">
+                    <button name="format" value="excel" class="btn btn-success">📥 Excel</button>
+                    <button name="format" value="word" class="btn btn-secondary">📄 Word</button>
+                </form>
+            </div>
+        <?php else: ?>
+            <div class="alert alert-warning">Нет данных.</div>
+        <?php endif; ?>
+    <?php elseif ($table === 'report_hall_stats'): ?>
+        <h2 class="text-center mb-4">Статистика по всем залам</h2>
+        <?php
+        $report = $db->ReportStatsForAllHalls();
+        if (!empty($report)): ?>
+            <table class="table table-bordered">
+                <thead class="thead-light">
+                <tr>
+                    <?php foreach (array_keys($report[0]) as $col): ?>
+                        <th><?= htmlspecialchars($col) ?></th>
+                    <?php endforeach; ?>
+                </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($report as $row): ?>
+                    <tr>
+                        <?php foreach ($row as $val): ?>
+                            <td><?= htmlspecialchars($val) ?></td>
+                        <?php endforeach; ?>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+            <div class="text-center mb-4">
+                <form method="post" action="export.php" target="_blank" class="d-inline">
+                    <input type="hidden" name="type" value="hall_stats_all">
+                    <button name="format" value="excel" class="btn btn-success">📥 Excel</button>
+                    <button name="format" value="word" class="btn btn-secondary">📄 Word</button>
+                </form>
+            </div>
+        <?php else: ?>
+            <div class="alert alert-warning">Нет данных.</div>
+        <?php endif; ?>
     <?php endif; ?>
 </div>
 <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.16.0/umd/popper.min.js"></script>
 <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+<script>
+
+    function showToast(type = 'success', message = '') {
+        const container = document.getElementById('toast-container');
+        const toast = document.createElement('div');
+        toast.className = `toast-message ${type}`;
+        toast.innerHTML = `<strong>${type === 'success' ? '✅' : '❌'}</strong> ${message}`;
+        container.appendChild(toast);
+
+        setTimeout(() => {
+            toast.style.animation = 'fadeOut 0.4s ease forwards';
+            toast.addEventListener('animationend', () => toast.remove());
+        }, 5000);
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        const form = document.getElementById('crud-form');
+        const submitBtn = document.getElementById('submit-btn');
+
+        if (!form || !submitBtn) return;
+
+        submitBtn.addEventListener('click', async () => {
+            const formData = new FormData(form);
+            formData.append('commit_changes', '1');
+
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Сохранение...';
+
+            try {
+                const response = await fetch(location.href, {
+                    method: 'POST',
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: formData
+                });
+
+                const text = await response.text();
+
+                let result;
+                try {
+                    result = JSON.parse(text);
+                } catch (e) {
+                    throw new Error('Сервер вернул не JSON:\n' + text);
+                }
+
+                document.querySelectorAll('.ajax-alert').forEach(el => el.remove());
+
+                if (result.success) {
+                    showToast('success', result.message || '✅ Изменения успешно сохранены!');
+                } else {
+                    (result.errors || []).forEach(msg => showToast('error', msg));
+                }
+            } catch (err) {
+                alert('Ошибка при отправке данных');
+                console.error('Ошибка при обработке ответа сервера:', err);
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Перенести изменения в БД';
+            }
+        });
+    });
+</script>
+<div class="toast-container" id="toast-container"></div>
 </body>
 </html>
