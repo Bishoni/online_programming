@@ -1,3 +1,124 @@
+## 🚀 0. Открытие системы через Docker
+
+---
+
+### 🔧 Шаги запуска
+
+1. **Клонировать репозиторий**:
+
+2. **Установить Docker и Docker Compose** (если ещё не установлены)
+
+3. **Перейти в корневую папку проекта через консоль**:
+
+4. **Запустить проект**:
+   ```bash
+   docker-compose up -d --build
+   ```
+
+5. ✅ **Проект запущен!**  
+   - База данных и записи создаются автоматически при запуске.
+   - Для активации страницы входа перейдите: `http://localhost:8000/public/index.php`
+
+---
+
+### 🛠 Полезные команды
+
+- 📜 Логи в реальном времени:
+  ```bash
+  docker-compose logs -f
+  ```
+
+- ⛔ Остановка и удаление контейнеров, томов и сетей:
+  ```bash
+  docker-compose down -v
+  ```
+
+---
+
+## 🧱 Структура `docker-compose.yml`
+
+```yaml
+version: '3.9'
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: web
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+    volumes:
+      - ./:/var/www/html
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nginx
+    volumes:
+      - ./:/var/www/html
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8000:80"
+    depends_on:
+      - web
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB:       ${DB_DATABASE}
+      POSTGRES_USER:     ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  pg_data:
+    driver: local
+```
+
+---
+
+## 🐘 Dockerfile (для PHP-FPM + PostgreSQL)
+
+```Dockerfile
+FROM php:8.2-fpm
+
+WORKDIR /var/www/html
+
+RUN apt-get update \
+ && apt-get install -y libzip-dev libpq-dev unzip \
+ && docker-php-ext-install zip pdo_pgsql \
+ && docker-php-ext-enable zip pdo_pgsql
+
+COPY . /var/www/html
+
+RUN chown -R www-data:www-data /var/www/html \
+ && find /var/www/html -type d -exec chmod 755 {} \; \
+ && find /var/www/html -type f -exec chmod 644 {} \;
+
+EXPOSE 9000
+```
+
+---
+
+### 👤 Тестовые данные для входа
+
+| Роль         | Логин         | Пароль     |
+|--------------|---------------|------------|
+| Администратор|    `admin1`   |`test_admin`|
+| Администратор|    `admin2    |`test_admin`|
+|--------------|---------------|------------|
+
+
+---
 # Проект: Система управления оффлайн-кинотеатром
 Данный проект представляет собой веб-приложение для управления кинотеатром, которое включает функционал для работы с фильмами, залами, сеансами и билетами. Ниже представлена документация проекта, включающая описание структуры базы данных, основные классы на PHP и реализованные CRUD-операции.
 ---
