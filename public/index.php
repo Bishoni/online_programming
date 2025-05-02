@@ -97,7 +97,7 @@ class Validator {
                 $stmt = $pdo->prepare("SELECT COUNT(*) FROM tickets WHERE showing_id = :id");
                 break;
             case 'tickets':
-                return true;
+                return true; // У билетов нет зависимостей
             default:
                 return true;
         }
@@ -817,6 +817,7 @@ if ($table === 'tickets') {
         toast.innerHTML = `<strong>${type === 'success' ? '✅' : '❌'}</strong> ${message}`;
         container.appendChild(toast);
 
+        // Удаление после показа
         setTimeout(() => {
             toast.style.animation = 'fadeOut 0.4s ease forwards';
             toast.addEventListener('animationend', () => toast.remove());
