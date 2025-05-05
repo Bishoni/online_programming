@@ -111,5 +111,5 @@ INSERT INTO Tickets (showing_id, seat_number) VALUES
                                                   (15, 1), (15, 2), (15, 3), (15, 4), (15, 5);
 
 INSERT INTO Administrators (login, admin_password, name, surname) VALUES
-                                                                      ('admin1', '$2y$12$rlzcixLu4d28eMnyZ6x9qeupYJGx3H62Mw8TvqNNWE7wBcopZdTeu', 'Name1', 'Surname1'),
-                                                                      ('admin2', '$2y$12$rlzcixLu4d28eMnyZ6x9qeupYJGx3H62Mw8TvqNNWE7wBcopZdTeu', 'Name2', 'Surname2');
+                                                                      ('admin1', '$2y$12$krv00SjHnxgwJu.Tf6i1EuSb1nImXaXS.qiOGJw63WL7ZTsZ8u59a', 'Name1', 'Surname1'),
+                                                                      ('admin2', '$2y$12$krv00SjHnxgwJu.Tf6i1EuSb1nImXaXS.qiOGJw63WL7ZTsZ8u59a', 'Name2', 'Surname2');
